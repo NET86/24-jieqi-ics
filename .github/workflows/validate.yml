@@ -83,12 +83,20 @@ jobs:
         run: |
           log="$RUNNER_TEMP/calendar-update.log"
           ok_line=""
+          data_range=""
+          astronomy_range=""
+          event_count=""
           changes=0
           warnings=0
           if [[ -f "$log" ]]; then
             ok_line="$(grep '^OK: HKO ' "$log" | tail -n 1 || true)"
             changes="$(grep -c '^CHANGE:' "$log" || true)"
             warnings="$(grep -c '^WARN:' "$log" || true)"
+            if [[ -n "$ok_line" ]]; then
+              data_range="$(sed -nE 's/.*consensus for ([0-9]{4}-[0-9]{4});.*/\1/p' <<<"$ok_line")"
+              astronomy_range="$(sed -nE 's/.*astronomy XML cross-check=([^;]+);.*/\1/p' <<<"$ok_line")"
+              event_count="$(sed -nE 's/.*wrote ([0-9]+) solar-term events;.*/\1/p' <<<"$ok_line")"
+            fi
           fi
 
           if [[ "$VERIFY_OUTCOME" == "success" && "$VALIDATE_OUTCOME" == "success" ]]; then
@@ -116,8 +124,12 @@ jobs:
             echo "### 二十四节气自动核验"
             echo
             echo "$result"
-            echo "- 核验时间：$(TZ=Asia/Shanghai date '+%F %H:%M')（Asia/Shanghai）"
-            [[ -n "$ok_line" ]] && echo "- 核验详情：${ok_line#OK: }"
+            echo "- 核验时间：$(TZ=Asia/Shanghai date '+%F %H:%M')（北京时间）"
+            if [[ -n "$ok_line" ]]; then
+              echo "- 数据范围：${data_range/-/–}（共 $event_count 个节气事件）"
+              echo "- 官方数据源：香港天文台多入口一致通过（至少 2 个一致）"
+              echo "- 天文数据交叉核验：${astronomy_range/-/–} 通过"
+            fi
             echo "- 日期变化：$changes 项"
             echo "- 发布情况：$publish"
             if (( warnings == 0 )); then
