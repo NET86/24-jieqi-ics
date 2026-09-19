@@ -36,19 +36,97 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
+
       - name: Verify against Hong Kong Observatory
-        run: python scripts/update_calendar.py
+        id: verify
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/update_calendar.py 2>&1 | tee "$RUNNER_TEMP/calendar-update.log"
+
       - name: Validate generated calendar
+        id: validate-generated
         run: python scripts/validate_ics.py
+
       - name: Commit successful verification
+        id: publish
+        if: success() && github.ref == 'refs/heads/master'
         shell: bash
         run: |
           if git diff --quiet -- README.md 24_solar_terms_2015-01-01_2050-12-31.ics; then
-            echo "No changes to commit."
+            echo "status=no-changes" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          if git diff --quiet -- 24_solar_terms_2015-01-01_2050-12-31.ics; then
+            status="verified-date-only"
+          else
+            status="calendar-updated"
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md 24_solar_terms_2015-01-01_2050-12-31.ics
           git commit -m "chore: verify calendar data $(TZ=Asia/Shanghai date +%F)"
           git push
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Verification summary
+        if: always()
+        shell: bash
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate-generated.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PUBLISH_STATUS: ${{ steps.publish.outputs.status }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          log="$RUNNER_TEMP/calendar-update.log"
+          ok_line=""
+          changes=0
+          warnings=0
+          if [[ -f "$log" ]]; then
+            ok_line="$(grep '^OK: HKO ' "$log" | tail -n 1 || true)"
+            changes="$(grep -c '^CHANGE:' "$log" || true)"
+            warnings="$(grep -c '^WARN:' "$log" || true)"
+          fi
+
+          if [[ "$VERIFY_OUTCOME" == "success" && "$VALIDATE_OUTCOME" == "success" ]]; then
+            result="✅ 核验通过"
+          else
+            result="❌ 核验失败"
+          fi
+
+          if [[ "$result" == "❌ 核验失败" ]]; then
+            publish="未发布"
+          elif [[ "$REF_NAME" != "master" ]]; then
+            publish="仅核验（非 master，不发布）"
+          elif [[ "$PUBLISH_OUTCOME" != "success" ]]; then
+            publish="发布失败"
+          else
+            case "$PUBLISH_STATUS" in
+              no-changes) publish="无需提交" ;;
+              verified-date-only) publish="仅更新最近核验日期" ;;
+              calendar-updated) publish="节气数据已更新" ;;
+              *) publish="已完成核验" ;;
+            esac
+          fi
+
+          {
+            echo "### 二十四节气自动核验"
+            echo
+            echo "$result"
+            echo "- 核验时间：$(TZ=Asia/Shanghai date '+%F %H:%M')（Asia/Shanghai）"
+            [[ -n "$ok_line" ]] && echo "- 核验详情：${ok_line#OK: }"
+            echo "- 日期变化：$changes 项"
+            echo "- 发布情况：$publish"
+            if (( warnings == 0 )); then
+              echo "- 警告：无"
+            else
+              echo "- 警告：⚠ $warnings 项，详见日志"
+            fi
+            if [[ "$result" == "✅ 核验通过" ]] && (( changes >= 6 && changes < 24 )); then
+              echo
+              echo "> ⚠ 本次日期变化较多，但已通过全部自动校验，建议查看日志。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
