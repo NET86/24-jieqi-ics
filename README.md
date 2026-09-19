@@ -2,7 +2,7 @@
 
 纯净的 24 节气 ICS 订阅，不包含传统节日或法定假日。
 
-最近核验：2026-09-18 · 范围：2015–2050 · 数据源：[香港天文台](https://www.hko.gov.hk/tc/gts/time/conversion.htm)
+最近核验：2026-09-19 · 范围：2015–2050 · 数据源：[香港天文台](https://www.hko.gov.hk/tc/gts/time/conversion.htm)
 
 ## 订阅
 
