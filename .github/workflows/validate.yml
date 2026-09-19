@@ -1,0 +1,54 @@
+name: Calendar maintenance
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "1 1 1,15 * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+concurrency:
+  group: calendar-maintenance
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python scripts/validate_ics.py
+
+  verify-official-data:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Verify against Hong Kong Observatory
+        run: python scripts/update_calendar.py
+      - name: Validate generated calendar
+        run: python scripts/validate_ics.py
+      - name: Commit successful verification
+        shell: bash
+        run: |
+          if git diff --quiet -- README.md 24_solar_terms_2015-01-01_2050-12-31.ics; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md 24_solar_terms_2015-01-01_2050-12-31.ics
+          git commit -m "chore: verify calendar data $(TZ=Asia/Shanghai date +%F)"
+          git push
