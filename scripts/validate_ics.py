@@ -12,6 +12,7 @@ from update_calendar import (
     START_YEAR,
     parse_dtstamp,
     parse_sequence,
+    validate_calendar_envelope,
     validate_term_series,
     validate_uid,
     validate_uid_contract,
@@ -83,34 +84,10 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
 def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
     errors: list[str] = []
 
-    if not lines or lines[0] != "BEGIN:VCALENDAR" or lines[-1] != "END:VCALENDAR":
-        errors.append("calendar must start with BEGIN:VCALENDAR and end with END:VCALENDAR")
-    if lines.count("BEGIN:VCALENDAR") != 1 or lines.count("END:VCALENDAR") != 1:
-        errors.append("calendar must contain exactly one VCALENDAR")
-
-    required_metadata = (
-        "PRODID:-//NET86//Chinese Solar Terms Calendar//ZH-CN",
-        "VERSION:2.0",
-        "X-WR-CALNAME:中国二十四节气",
-        "X-WR-TIMEZONE:Asia/Shanghai",
-        "X-WR-CALDESC:2015-2050中国二十四节气",
-    )
-    for item in required_metadata:
-        count = lines.count(item)
-        if count != 1:
-            errors.append(f"calendar metadata must appear exactly once: {item} (found {count})")
-
-    # RFC 5545 makes CALSCALE and METHOD optional, but if this calendar
-    # publishes them they must remain singleton and use the supported value.
-    for property_name, expected in (
-        ("CALSCALE", "CALSCALE:GREGORIAN"),
-        ("METHOD", "METHOD:PUBLISH"),
-    ):
-        values = [line for line in lines if line.startswith(property_name + ":")]
-        if len(values) > 1:
-            errors.append(f"calendar metadata must not repeat: {property_name}")
-        elif values and values[0] != expected:
-            errors.append(f"unsupported calendar metadata: {values[0]}")
+    try:
+        validate_calendar_envelope(lines)
+    except RuntimeError as exc:
+        errors.append(str(exc))
 
     try:
         events = parse_events(lines)

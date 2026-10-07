@@ -111,6 +111,69 @@ DATE_UID_RE = re.compile(
 QINGMING_UID_RE = re.compile(r"^(?P<year>[0-9]{4})-qingming@net86\.github\.io$")
 MAX_SEQUENCE = 2_147_483_647
 UID_CONTRACT_SHA256 = "5d92bfa1343431b2cecbac39b3c79a19ae35f462f226580c4b2e789702c6fe4c"
+REQUIRED_CALENDAR_LINES = (
+    "PRODID:-//NET86//Chinese Solar Terms Calendar//ZH-CN",
+    "VERSION:2.0",
+    "X-WR-CALNAME:中国二十四节气",
+    "X-WR-TIMEZONE:Asia/Shanghai",
+    "X-WR-CALDESC:2015-2050中国二十四节气",
+)
+OPTIONAL_CALENDAR_LINES = (
+    "CALSCALE:GREGORIAN",
+    "METHOD:PUBLISH",
+)
+ALLOWED_TOP_LEVEL_LINES = frozenset(
+    ("BEGIN:VCALENDAR", "END:VCALENDAR", *REQUIRED_CALENDAR_LINES, *OPTIONAL_CALENDAR_LINES)
+)
+
+
+def validate_calendar_envelope(lines: list[str]) -> None:
+    if not lines or lines[0] != "BEGIN:VCALENDAR" or lines[-1] != "END:VCALENDAR":
+        raise RuntimeError("calendar must start with BEGIN:VCALENDAR and end with END:VCALENDAR")
+    if lines.count("BEGIN:VCALENDAR") != 1 or lines.count("END:VCALENDAR") != 1:
+        raise RuntimeError("calendar must contain exactly one VCALENDAR")
+
+    for item in REQUIRED_CALENDAR_LINES:
+        count = lines.count(item)
+        if count != 1:
+            raise RuntimeError(
+                f"calendar metadata must appear exactly once: {item} (found {count})"
+            )
+
+    for expected in OPTIONAL_CALENDAR_LINES:
+        property_name = expected.partition(":")[0]
+        values = [
+            line
+            for line in lines
+            if line.partition(":")[0].partition(";")[0].upper() == property_name
+        ]
+        unsupported = [value for value in values if value != expected]
+        if unsupported:
+            raise RuntimeError(f"unsupported calendar metadata: {unsupported[0]}")
+        if len(values) > 1:
+            raise RuntimeError(f"calendar metadata must not repeat: {property_name}")
+
+    in_event = False
+    for line_no, line in enumerate(lines, 1):
+        if line == "BEGIN:VEVENT":
+            if in_event:
+                raise RuntimeError(f"line {line_no}: nested VEVENT")
+            in_event = True
+            continue
+        if line == "END:VEVENT":
+            if not in_event:
+                raise RuntimeError(f"line {line_no}: END:VEVENT without BEGIN:VEVENT")
+            in_event = False
+            continue
+        if in_event:
+            continue
+        if line not in ALLOWED_TOP_LEVEL_LINES:
+            raise RuntimeError(f"line {line_no}: unsupported VCALENDAR content: {line}")
+
+    if in_event:
+        raise RuntimeError("unterminated VEVENT")
+
+
 
 
 def parse_dtstamp(value: str) -> datetime:
@@ -419,6 +482,7 @@ def crosscheck_near_term_astronomy(
 
 
 def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, str]]:
+    validate_calendar_envelope(lines)
     events: dict[tuple[int, str], dict[str, str]] = {}
     current: dict[str, str] | None = None
     seen_properties: set[str] = set()
