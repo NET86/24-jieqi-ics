@@ -6,7 +6,15 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
 
-from update_calendar import END_YEAR, EXPECTED_TERMS, START_YEAR, validate_term_series
+from update_calendar import (
+    END_YEAR,
+    EXPECTED_TERMS,
+    START_YEAR,
+    parse_dtstamp,
+    parse_sequence,
+    validate_term_series,
+    validate_uid,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 ICS = ROOT / "24_solar_terms_2015-01-01_2050-12-31.ics"
@@ -41,13 +49,17 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
         # Do not silently accept the last of conflicting singleton fields:
         # calendar clients may select a different occurrence or parameter form.
         property_name = line.partition(":")[0].partition(";")[0].upper()
-        if property_name in {"UID", "DTSTART", "DTEND", "SUMMARY"}:
+        if property_name in {"DTSTAMP", "UID", "SEQUENCE", "DTSTART", "DTEND", "SUMMARY"}:
             if property_name in seen_properties:
                 raise ValueError(f"line {line_no}: duplicate {property_name} in VEVENT")
             seen_properties.add(property_name)
 
-        if line.startswith("UID:"):
+        if line.startswith("DTSTAMP:"):
+            current["DTSTAMP"] = line[8:]
+        elif line.startswith("UID:"):
             current["UID"] = line[4:]
+        elif line.startswith("SEQUENCE:"):
+            current["SEQUENCE"] = line[9:]
         elif line.startswith("DTSTART;VALUE=DATE:"):
             current["DTSTART"] = line.removeprefix("DTSTART;VALUE=DATE:")
         elif line.startswith("DTEND;VALUE=DATE:"):
@@ -66,17 +78,32 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
 
     if not lines or lines[0] != "BEGIN:VCALENDAR" or lines[-1] != "END:VCALENDAR":
         errors.append("calendar must start with BEGIN:VCALENDAR and end with END:VCALENDAR")
+    if lines.count("BEGIN:VCALENDAR") != 1 or lines.count("END:VCALENDAR") != 1:
+        errors.append("calendar must contain exactly one VCALENDAR")
 
-    required_metadata = {
+    required_metadata = (
+        "PRODID:-//NET86//Chinese Solar Terms Calendar//ZH-CN",
         "VERSION:2.0",
-        "CALSCALE:GREGORIAN",
         "X-WR-CALNAME:中国二十四节气",
         "X-WR-TIMEZONE:Asia/Shanghai",
         "X-WR-CALDESC:2015-2050中国二十四节气",
-    }
-    missing_metadata = sorted(required_metadata.difference(lines))
-    if missing_metadata:
-        errors.append(f"missing calendar metadata: {', '.join(missing_metadata)}")
+    )
+    for item in required_metadata:
+        count = lines.count(item)
+        if count != 1:
+            errors.append(f"calendar metadata must appear exactly once: {item} (found {count})")
+
+    # RFC 5545 makes CALSCALE and METHOD optional, but if this calendar
+    # publishes them they must remain singleton and use the supported value.
+    for property_name, expected in (
+        ("CALSCALE", "CALSCALE:GREGORIAN"),
+        ("METHOD", "METHOD:PUBLISH"),
+    ):
+        values = [line for line in lines if line.startswith(property_name + ":")]
+        if len(values) > 1:
+            errors.append(f"calendar metadata must not repeat: {property_name}")
+        elif values and values[0] != expected:
+            errors.append(f"unsupported calendar metadata: {values[0]}")
 
     try:
         events = parse_events(lines)
@@ -93,7 +120,7 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
     by_year: dict[int, list[tuple[date, str]]] = {}
 
     for index, event in enumerate(events, 1):
-        missing = [key for key in ("UID", "DTSTART", "DTEND", "SUMMARY") if key not in event]
+        missing = [key for key in ("DTSTAMP", "UID", "DTSTART", "DTEND", "SUMMARY") if key not in event]
         if missing:
             errors.append(f"event {index}: missing {', '.join(missing)}")
             continue
@@ -107,6 +134,16 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
 
         if summary not in EXPECTED_TERMS:
             errors.append(f"event {index}: unexpected SUMMARY {summary!r}")
+
+        try:
+            parse_dtstamp(event["DTSTAMP"])
+        except ValueError as exc:
+            errors.append(f"event {index}: {exc}")
+        if "SEQUENCE" in event:
+            try:
+                parse_sequence(event["SEQUENCE"])
+            except ValueError as exc:
+                errors.append(f"event {index}: {exc}")
 
         try:
             if any(len(event[key]) != 8 or not event[key].isascii() or not event[key].isdigit()
@@ -124,6 +161,11 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
             errors.append(
                 f"event {index}: DTEND must be exactly one day after DTSTART"
             )
+
+        try:
+            validate_uid(uid, start.year, summary, start)
+        except ValueError as exc:
+            errors.append(f"event {index}: {exc}")
 
         if start.year not in EXPECTED_YEARS:
             errors.append(
