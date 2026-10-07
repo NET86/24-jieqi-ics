@@ -235,6 +235,20 @@ class CalendarBoundaryTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+    def test_vcalendar_top_level_semantics_are_closed(self):
+        for line, pattern in (
+            ("REFRESH-INTERVAL;VALUE=DURATION:PT1M", "unsupported VCALENDAR content"),
+            ("METHOD;X-TEST=1:CANCEL", "unsupported calendar metadata"),
+            ("BEGIN:VTODO", "unsupported VCALENDAR content"),
+        ):
+            with self.subTest(line=line):
+                text = self.text.replace("METHOD:PUBLISH\n", f"METHOD:PUBLISH\n{line}\n", 1)
+                _, errors = validator.validate_lines(text.splitlines())
+                self.assertTrue(any(pattern in error for error in errors), errors)
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    updater.parse_existing_events(text.splitlines())
+
+
     def test_hko_final_source_must_remain_approved_https(self):
         requested = "https://www.hko.gov.hk/path"
         self.assertEqual(
