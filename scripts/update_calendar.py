@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -27,6 +30,12 @@ HKO_URLS = (
 HKO_ASTRONOMY_XML = (
     "https://www.hko.gov.hk/en/gts/astronomy/data/files/24SolarTerms_{year}.xml"
 )
+HKO_ALLOWED_HOSTS = frozenset(
+    urlparse(url).hostname
+    for url in (*HKO_URLS, HKO_ASTRONOMY_XML)
+    if urlparse(url).hostname
+)
+TRANSACTION_DIR = ROOT / ".calendar-update-transaction"
 
 TERM_MAP = {
     "小寒": "小寒",
@@ -93,6 +102,63 @@ TERM_WINDOWS = {
 
 DATE_RE = re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日")
 VERIFIED_RE = re.compile(r"最近核验：\d{4}-\d{2}-\d{2}")
+DTSTAMP_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+SEQUENCE_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+DATE_UID_RE = re.compile(
+    r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})-lc@infinet\.github\.io$"
+)
+QINGMING_UID_RE = re.compile(r"^(?P<year>[0-9]{4})-qingming@net86\.github\.io$")
+MAX_SEQUENCE = 2_147_483_647
+
+
+def parse_dtstamp(value: str) -> datetime:
+    if not DTSTAMP_RE.fullmatch(value):
+        raise ValueError(f"invalid UTC DTSTAMP: {value!r}")
+    try:
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"invalid UTC DTSTAMP: {value!r}") from exc
+
+
+def parse_sequence(value: str) -> int:
+    if not SEQUENCE_RE.fullmatch(value):
+        raise ValueError(f"invalid SEQUENCE: {value!r}")
+    sequence = int(value)
+    if sequence > MAX_SEQUENCE:
+        raise ValueError(f"SEQUENCE exceeds {MAX_SEQUENCE}")
+    return sequence
+
+
+def validate_uid(uid: str, year: int, term: str, event_date: date) -> None:
+    if term == "清明":
+        match = QINGMING_UID_RE.fullmatch(uid)
+        if not match or int(match.group("year")) != year:
+            raise ValueError(f"{year} {term}: invalid stable UID {uid!r}")
+        return
+
+    match = DATE_UID_RE.fullmatch(uid)
+    if not match:
+        raise ValueError(f"{year} {term}: invalid stable UID {uid!r}")
+    try:
+        uid_date = date(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+        )
+    except ValueError as exc:
+        raise ValueError(f"{year} {term}: invalid stable UID {uid!r}") from exc
+    if uid_date.year != year:
+        raise ValueError(
+            f"{year} {term}: stable UID year {uid_date.year} does not match event year"
+        )
+    window = TERM_WINDOWS.get(term)
+    if window is None:
+        raise ValueError(f"{year} {term}: invalid stable UID {uid!r}")
+    month, min_day, max_day = window
+    if uid_date.month != month or not min_day <= uid_date.day <= max_day:
+        raise ValueError(
+            f"{year} {term}: stable UID date {uid_date} is outside the term window"
+        )
 
 
 def decode_hko(payload: bytes) -> str:
@@ -153,7 +219,23 @@ def parse_hko_text(year: int, text: str) -> tuple[tuple[date, str], ...]:
     return tuple(found)
 
 
-def fetch_source(year: int, url_template: str, attempts: int = 2) -> tuple[tuple[date, str], ...]:
+def validate_hko_final_url(requested_url: str, final_url: str) -> str:
+    requested = urlparse(requested_url)
+    final = urlparse(final_url)
+    if requested.scheme != "https" or requested.hostname not in HKO_ALLOWED_HOSTS:
+        raise RuntimeError(f"untrusted HKO request source: {requested_url}")
+    if final.scheme != "https" or final.hostname not in HKO_ALLOWED_HOSTS:
+        raise RuntimeError(
+            f"HKO request redirected outside approved HTTPS hosts: {requested_url} -> {final_url}"
+        )
+    return final.hostname
+
+
+def fetch_source(
+    year: int,
+    url_template: str,
+    attempts: int = 2,
+) -> tuple[tuple[tuple[date, str], ...], str]:
     url = url_template.format(year=year)
     request = Request(
         url,
@@ -166,11 +248,12 @@ def fetch_source(year: int, url_template: str, attempts: int = 2) -> tuple[tuple
             with urlopen(request, timeout=20) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
+                final_host = validate_hko_final_url(url, response.geturl())
                 content_type = response.headers.get("Content-Type", "")
                 if "text" not in content_type.lower():
                     raise RuntimeError(f"unexpected Content-Type {content_type!r} for {url}")
                 text = decode_hko(response.read())
-            return parse_hko_text(year, text)
+            return parse_hko_text(year, text), final_host
         except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
             last_error = exc
             if attempt < attempts:
@@ -180,30 +263,34 @@ def fetch_source(year: int, url_template: str, attempts: int = 2) -> tuple[tuple
 
 
 def fetch_year(year: int) -> list[tuple[date, str]]:
-    results: list[tuple[str, tuple[tuple[date, str], ...]]] = []
+    results: dict[str, tuple[tuple[date, str], ...]] = {}
     failures: list[str] = []
 
-    # Normal path: two official HKO hostnames agree, so the third is not needed.
-    for url_template in HKO_URLS[:2]:
-        host = urlparse(url_template).netloc
+    def collect(url_template: str) -> None:
+        requested_host = urlparse(url_template).hostname or url_template
         try:
-            results.append((host, fetch_source(year, url_template)))
+            data, final_host = fetch_source(year, url_template)
+            previous = results.get(final_host)
+            if previous is not None and previous != data:
+                raise RuntimeError(
+                    f"{year}: repeated final HKO source {final_host} returned inconsistent data"
+                )
+            results[final_host] = data
         except RuntimeError as exc:
-            failures.append(str(exc))
+            failures.append(f"{requested_host}: {exc}")
 
-    if len(results) == 2 and results[0][1] == results[1][1]:
-        return list(results[0][1])
+    # Normal path: two independently resolved official final hosts agree.
+    for url_template in HKO_URLS[:2]:
+        collect(url_template)
 
-    # A failure or disagreement invokes the third official hostname as tiebreaker.
-    third_template = HKO_URLS[2]
-    third_host = urlparse(third_template).netloc
-    try:
-        results.append((third_host, fetch_source(year, third_template)))
-    except RuntimeError as exc:
-        failures.append(str(exc))
+    if len(results) >= 2 and len(set(results.values())) == 1:
+        return list(next(iter(results.values())))
+
+    # A failure, duplicate final source, or disagreement invokes the third host.
+    collect(HKO_URLS[2])
 
     groups: dict[tuple[tuple[date, str], ...], list[str]] = {}
-    for host, data in results:
+    for host, data in results.items():
         groups.setdefault(data, []).append(host)
 
     if groups:
@@ -212,7 +299,12 @@ def fetch_year(year: int) -> list[tuple[date, str]]:
             if failures:
                 print(f"WARN: {year}: official mirror failure(s): {'; '.join(failures)}", file=sys.stderr)
             if len(groups) > 1:
-                disagreeing = [host for data, group_hosts in groups.items() if data != winner for host in group_hosts]
+                disagreeing = [
+                    host
+                    for data, group_hosts in groups.items()
+                    if data != winner
+                    for host in group_hosts
+                ]
                 print(
                     f"WARN: {year}: official mirrors disagreed; "
                     f"accepted consensus from {', '.join(hosts)}; "
@@ -221,9 +313,10 @@ def fetch_year(year: int) -> list[tuple[date, str]]:
                 )
             return list(winner)
 
-    detail = "; ".join(failures) if failures else "official mirrors returned different data"
+    detail = "; ".join(failures) if failures else (
+        "official mirrors did not provide two distinct final-source votes"
+    )
     raise RuntimeError(f"{year}: no 2-of-3 HKO consensus: {detail}")
-
 
 def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str], ...]:
     url = HKO_ASTRONOMY_XML.format(year=year)
@@ -238,6 +331,7 @@ def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str],
             with urlopen(request, timeout=20) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
+                validate_hko_final_url(url, response.geturl())
                 content_type = response.headers.get("Content-Type", "")
                 if "xml" not in content_type.lower():
                     raise RuntimeError(f"unexpected Content-Type {content_type!r} for {url}")
@@ -307,21 +401,45 @@ def crosscheck_near_term_astronomy(
 def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, str]]:
     events: dict[tuple[int, str], dict[str, str]] = {}
     current: dict[str, str] | None = None
+    seen_properties: set[str] = set()
 
-    for line in lines:
+    for line_no, line in enumerate(lines, 1):
         if line == "BEGIN:VEVENT":
             if current is not None:
                 raise RuntimeError("nested VEVENT in existing calendar")
             current = {}
+            seen_properties.clear()
             continue
         if line == "END:VEVENT":
             if current is None:
                 raise RuntimeError("END:VEVENT without BEGIN:VEVENT in existing calendar")
-            required = {"DTSTART", "SUMMARY", "UID"}
+            required = {"DTSTAMP", "DTSTART", "DTEND", "SUMMARY", "UID"}
             if not required <= current.keys():
                 missing = sorted(required.difference(current))
                 raise RuntimeError(f"existing VEVENT missing fields: {missing}")
-            year = int(current["DTSTART"][:4])
+            try:
+                parse_dtstamp(current["DTSTAMP"])
+                if "SEQUENCE" in current:
+                    parse_sequence(current["SEQUENCE"])
+                if any(
+                    len(current[key]) != 8
+                    or not current[key].isascii()
+                    or not current[key].isdigit()
+                    for key in ("DTSTART", "DTEND")
+                ):
+                    raise ValueError("DATE must contain exactly eight ASCII digits")
+                start_date = datetime.strptime(current["DTSTART"], "%Y%m%d").date()
+                end_date = datetime.strptime(current["DTEND"], "%Y%m%d").date()
+                if end_date != start_date + timedelta(days=1):
+                    raise ValueError("DTEND must be exactly one day after DTSTART")
+            except ValueError as exc:
+                raise RuntimeError(f"invalid existing VEVENT: {exc}") from exc
+
+            year = start_date.year
+            try:
+                validate_uid(current["UID"], year, current["SUMMARY"], start_date)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
             key = (year, current["SUMMARY"])
             if key in events:
                 raise RuntimeError(f"duplicate existing year/term event: {key}")
@@ -331,19 +449,33 @@ def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, s
         if current is None:
             continue
 
+        property_name = line.partition(":")[0].partition(";")[0].upper()
+        if property_name in {"DTSTAMP", "UID", "SEQUENCE", "DTSTART", "DTEND", "SUMMARY"}:
+            if property_name in seen_properties:
+                raise RuntimeError(f"line {line_no}: duplicate {property_name} in existing VEVENT")
+            seen_properties.add(property_name)
+
+        if property_name == "DTSTAMP" and not line.startswith("DTSTAMP:"):
+            raise RuntimeError(f"line {line_no}: unsupported DTSTAMP form")
+        if property_name == "SEQUENCE" and not line.startswith("SEQUENCE:"):
+            raise RuntimeError(f"line {line_no}: unsupported SEQUENCE form")
+
         if line.startswith("DTSTAMP:"):
             current["DTSTAMP"] = line[8:]
         elif line.startswith("UID:"):
             current["UID"] = line[4:]
+        elif line.startswith("SEQUENCE:"):
+            current["SEQUENCE"] = line[9:]
         elif line.startswith("DTSTART;VALUE=DATE:"):
             current["DTSTART"] = line.removeprefix("DTSTART;VALUE=DATE:")
+        elif line.startswith("DTEND;VALUE=DATE:"):
+            current["DTEND"] = line.removeprefix("DTEND;VALUE=DATE:")
         elif line.startswith("SUMMARY:"):
             current["SUMMARY"] = line[8:]
 
     if current is not None:
         raise RuntimeError("unterminated VEVENT in existing calendar")
     return events
-
 
 def validate_existing_events(
     existing: dict[tuple[int, str], dict[str, str]],
@@ -370,8 +502,13 @@ def validate_existing_events(
 def build_calendar(
     official: dict[int, list[tuple[date, str]]],
     existing: dict[tuple[int, str], dict[str, str]],
+    now: datetime | None = None,
 ) -> str:
-    now_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("build_calendar now must be timezone-aware")
+    now_stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
         "PRODID:-//NET86//Chinese Solar Terms Calendar//ZH-CN",
@@ -389,14 +526,28 @@ def build_calendar(
             if old is None:
                 raise RuntimeError(f"missing existing UID for {year} {term}")
             uid = old["UID"]
-            dtstamp = old.get("DTSTAMP") or now_stamp
+            old_date = datetime.strptime(old["DTSTART"], "%Y%m%d").date()
+            changed = old_date != event_date
+            if changed:
+                dtstamp = now_stamp
+                sequence = parse_sequence(old.get("SEQUENCE", "0")) + 1
+                if sequence > MAX_SEQUENCE:
+                    raise RuntimeError(f"{year} {term}: SEQUENCE overflow")
+                sequence_text: str | None = str(sequence)
+            else:
+                dtstamp = old["DTSTAMP"]
+                sequence_text = old.get("SEQUENCE")
 
             end_date = event_date + timedelta(days=1)
-            lines.extend(
+            event_lines = [
+                "BEGIN:VEVENT",
+                f"DTSTAMP:{dtstamp}",
+                f"UID:{uid}",
+            ]
+            if sequence_text is not None:
+                event_lines.append(f"SEQUENCE:{sequence_text}")
+            event_lines.extend(
                 [
-                    "BEGIN:VEVENT",
-                    f"DTSTAMP:{dtstamp}",
-                    f"UID:{uid}",
                     f"DTSTART;VALUE=DATE:{event_date:%Y%m%d}",
                     f"DTEND;VALUE=DATE:{end_date:%Y%m%d}",
                     "STATUS:CONFIRMED",
@@ -404,10 +555,10 @@ def build_calendar(
                     "END:VEVENT",
                 ]
             )
+            lines.extend(event_lines)
 
     lines.append("END:VCALENDAR")
     return "\n".join(lines) + "\n"
-
 
 def update_verified_date(readme: str) -> str:
     verified = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
@@ -441,7 +592,80 @@ def describe_date_changes(
     return changes
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def recover_publication_transaction() -> None:
+    if not TRANSACTION_DIR.exists():
+        return
+    ready = TRANSACTION_DIR / "READY"
+    if not ready.exists():
+        shutil.rmtree(TRANSACTION_DIR)
+        return
+
+    backup_ics = TRANSACTION_DIR / "calendar.old"
+    backup_readme = TRANSACTION_DIR / "readme.old"
+    if not backup_ics.exists() or not backup_readme.exists():
+        raise RuntimeError("incomplete calendar publication recovery data")
+
+    atomic_write_bytes(ICS, backup_ics.read_bytes())
+    atomic_write_bytes(README, backup_readme.read_bytes())
+    shutil.rmtree(TRANSACTION_DIR)
+
+
+def validate_staged_outputs(calendar: str, readme: str) -> None:
+    events = parse_existing_events(calendar.splitlines())
+    validate_existing_events(events)
+    by_year: dict[int, list[tuple[date, str]]] = {}
+    for (year, term), event in events.items():
+        event_date = datetime.strptime(event["DTSTART"], "%Y%m%d").date()
+        by_year.setdefault(year, []).append((event_date, term))
+    for year in range(START_YEAR, END_YEAR + 1):
+        ordered = sorted(by_year.get(year, []))
+        validate_term_series(year, ordered)
+
+    if len(VERIFIED_RE.findall(readme)) != 1:
+        raise RuntimeError("staged README must contain exactly one verification date marker")
+
+
+def publish_outputs(calendar: str, readme: str) -> None:
+    recover_publication_transaction()
+    validate_staged_outputs(calendar, readme)
+
+    TRANSACTION_DIR.mkdir()
+    atomic_write_bytes(TRANSACTION_DIR / "calendar.old", ICS.read_bytes())
+    atomic_write_bytes(TRANSACTION_DIR / "readme.old", README.read_bytes())
+    atomic_write_bytes(TRANSACTION_DIR / "calendar.new", calendar.encode("utf-8"))
+    atomic_write_bytes(TRANSACTION_DIR / "readme.new", readme.encode("utf-8"))
+    atomic_write_bytes(TRANSACTION_DIR / "READY", b"ready\n")
+
+    try:
+        os.replace(TRANSACTION_DIR / "calendar.new", ICS)
+        os.replace(TRANSACTION_DIR / "readme.new", README)
+    except BaseException:
+        recover_publication_transaction()
+        raise
+    else:
+        shutil.rmtree(TRANSACTION_DIR)
+
+
+
 def main() -> int:
+    recover_publication_transaction()
     current_year = datetime.now(ZoneInfo("Asia/Shanghai")).year
     if current_year > END_YEAR:
         raise RuntimeError(
@@ -472,10 +696,10 @@ def main() -> int:
 
     calendar = build_calendar(official, existing)
 
-    # Remote publication is additionally gated by validate_ics.py in Actions.
-    # Nothing is committed if source consensus, parsing, generation, or validation fails.
-    ICS.write_text(calendar, encoding="utf-8", newline="\n")
-    README.write_text(readme, encoding="utf-8", newline="\n")
+    # Validate both generated artifacts before either target is replaced.
+    # A transaction backup restores both files after ordinary write failure and
+    # on the next run after a crash between the two replacements.
+    publish_outputs(calendar, readme)
 
     astronomy_range = (
         f"{astronomy_years[0]}-{astronomy_years[-1]}"
