@@ -217,6 +217,31 @@ class CalendarBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, pattern):
                     updater.parse_existing_events(text.splitlines())
 
+    def test_vcalendar_semantics_are_closed_to_unreviewed_extensions(self):
+        for text, pattern in (
+            (
+                self.text.replace(
+                    'METHOD:PUBLISH',
+                    'METHOD:PUBLISH\nREFRESH-INTERVAL;VALUE=DURATION:PT1M',
+                    1,
+                ),
+                'unsupported VCALENDAR property/form',
+            ),
+            (
+                self.text.replace(
+                    'METHOD:PUBLISH',
+                    'METHOD:PUBLISH\nMETHOD;X-TEST=1:CANCEL',
+                    1,
+                ),
+                'unsupported VCALENDAR property/form',
+            ),
+        ):
+            with self.subTest(pattern=pattern):
+                _, errors = validator.validate_lines(text.splitlines())
+                self.assertTrue(any(pattern in error for error in errors), errors)
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    updater.parse_existing_events(text.splitlines())
+
     def test_calendar_metadata_is_singleton_and_complete(self):
         mutations = (
             self.text.replace('PRODID:-//NET86//Chinese Solar Terms Calendar//ZH-CN\n', '', 1),
