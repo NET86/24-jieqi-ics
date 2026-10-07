@@ -18,12 +18,14 @@ EXPECTED_EVENT_COUNT = len(EXPECTED_TERMS) * len(EXPECTED_YEARS)
 def parse_events(lines: list[str]) -> list[dict[str, str]]:
     events: list[dict[str, str]] = []
     current: dict[str, str] | None = None
+    seen_properties: set[str] = set()
 
     for line_no, line in enumerate(lines, 1):
         if line == "BEGIN:VEVENT":
             if current is not None:
                 raise ValueError(f"line {line_no}: nested VEVENT")
             current = {}
+            seen_properties.clear()
             continue
 
         if line == "END:VEVENT":
@@ -35,6 +37,14 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
 
         if current is None:
             continue
+
+        # Do not silently accept the last of conflicting singleton fields:
+        # calendar clients may select a different occurrence or parameter form.
+        property_name = line.partition(":")[0].partition(";")[0].upper()
+        if property_name in {"UID", "DTSTART", "DTEND", "SUMMARY"}:
+            if property_name in seen_properties:
+                raise ValueError(f"line {line_no}: duplicate {property_name} in VEVENT")
+            seen_properties.add(property_name)
 
         if line.startswith("UID:"):
             current["UID"] = line[4:]
@@ -99,6 +109,9 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
             errors.append(f"event {index}: unexpected SUMMARY {summary!r}")
 
         try:
+            if any(len(event[key]) != 8 or not event[key].isascii() or not event[key].isdigit()
+                   for key in ("DTSTART", "DTEND")):
+                raise ValueError("DATE must contain exactly eight ASCII digits")
             start = datetime.strptime(event["DTSTART"], "%Y%m%d").date()
             end = datetime.strptime(event["DTEND"], "%Y%m%d").date()
         except ValueError:
