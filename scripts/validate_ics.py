@@ -2,31 +2,30 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
+
+from update_calendar import END_YEAR, EXPECTED_TERMS, START_YEAR, validate_term_series
 
 ROOT = Path(__file__).resolve().parents[1]
 ICS = ROOT / "24_solar_terms_2015-01-01_2050-12-31.ics"
 
-EXPECTED_TERMS = (
-    "小寒", "大寒", "立春", "雨水", "惊蛰", "春分", "清明", "谷雨",
-    "立夏", "小满", "芒种", "夏至", "小暑", "大暑", "立秋", "处暑",
-    "白露", "秋分", "寒露", "霜降", "立冬", "小雪", "大雪", "冬至",
-)
-EXPECTED_YEARS = range(2015, 2051)
+EXPECTED_YEARS = range(START_YEAR, END_YEAR + 1)
 EXPECTED_EVENT_COUNT = len(EXPECTED_TERMS) * len(EXPECTED_YEARS)
 
 
 def parse_events(lines: list[str]) -> list[dict[str, str]]:
     events: list[dict[str, str]] = []
     current: dict[str, str] | None = None
+    seen_properties: set[str] = set()
 
     for line_no, line in enumerate(lines, 1):
         if line == "BEGIN:VEVENT":
             if current is not None:
                 raise ValueError(f"line {line_no}: nested VEVENT")
             current = {}
+            seen_properties.clear()
             continue
 
         if line == "END:VEVENT":
@@ -38,6 +37,14 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
 
         if current is None:
             continue
+
+        # Do not silently accept the last of conflicting singleton fields:
+        # calendar clients may select a different occurrence or parameter form.
+        property_name = line.partition(":")[0].partition(";")[0].upper()
+        if property_name in {"UID", "DTSTART", "DTEND", "SUMMARY"}:
+            if property_name in seen_properties:
+                raise ValueError(f"line {line_no}: duplicate {property_name} in VEVENT")
+            seen_properties.add(property_name)
 
         if line.startswith("UID:"):
             current["UID"] = line[4:]
@@ -54,8 +61,7 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
     return events
 
 
-def main() -> int:
-    lines = ICS.read_text(encoding="utf-8").splitlines()
+def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
     errors: list[str] = []
 
     if not lines or lines[0] != "BEGIN:VCALENDAR" or lines[-1] != "END:VCALENDAR":
@@ -84,7 +90,7 @@ def main() -> int:
         )
 
     uids: list[str] = []
-    by_year: dict[int, list[str]] = {}
+    by_year: dict[int, list[tuple[date, str]]] = {}
 
     for index, event in enumerate(events, 1):
         missing = [key for key in ("UID", "DTSTART", "DTEND", "SUMMARY") if key not in event]
@@ -103,6 +109,9 @@ def main() -> int:
             errors.append(f"event {index}: unexpected SUMMARY {summary!r}")
 
         try:
+            if any(len(event[key]) != 8 or not event[key].isascii() or not event[key].isdigit()
+                   for key in ("DTSTART", "DTEND")):
+                raise ValueError("DATE must contain exactly eight ASCII digits")
             start = datetime.strptime(event["DTSTART"], "%Y%m%d").date()
             end = datetime.strptime(event["DTEND"], "%Y%m%d").date()
         except ValueError:
@@ -117,9 +126,11 @@ def main() -> int:
             )
 
         if start.year not in EXPECTED_YEARS:
-            errors.append(f"event {index}: year {start.year} is outside 2015-2050")
+            errors.append(
+                f"event {index}: year {start.year} is outside {START_YEAR}-{END_YEAR}"
+            )
         else:
-            by_year.setdefault(start.year, []).append(summary)
+            by_year.setdefault(start.year, []).append((start, summary))
 
     duplicate_uids = [uid for uid, count in Counter(uids).items() if count > 1]
     if duplicate_uids:
@@ -127,13 +138,26 @@ def main() -> int:
 
     expected_counter = Counter(EXPECTED_TERMS)
     for year in EXPECTED_YEARS:
-        actual = Counter(by_year.get(year, []))
+        series = by_year.get(year, [])
+        actual = Counter(term for _, term in series)
         if actual != expected_counter:
             missing = list((expected_counter - actual).elements())
             extra = list((actual - expected_counter).elements())
             errors.append(
                 f"{year}: term set mismatch; missing={missing or '-'}, extra={extra or '-'}"
             )
+            continue
+        try:
+            validate_term_series(year, series)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    return events, errors
+
+
+def main() -> int:
+    lines = ICS.read_text(encoding="utf-8").splitlines()
+    events, errors = validate_lines(lines)
 
     if errors:
         for error in errors:
@@ -142,7 +166,7 @@ def main() -> int:
 
     print(
         f"OK: {len(events)} events, {len(EXPECTED_TERMS)} terms/year, "
-        f"{min(EXPECTED_YEARS)}-{max(EXPECTED_YEARS)}, unique UIDs"
+        f"{min(EXPECTED_YEARS)}-{max(EXPECTED_YEARS)}, unique UIDs, semantic dates"
     )
     return 0
 
