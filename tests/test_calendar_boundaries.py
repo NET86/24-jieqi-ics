@@ -42,7 +42,14 @@ class CalendarBoundaryTests(unittest.TestCase):
             with self.subTest(duplicate=duplicate):
                 text = self.text.replace(original, duplicate + '\n' + original, 1)
                 _, errors = validator.validate_lines(text.splitlines())
-                self.assertTrue(any('duplicate ' in error for error in errors), errors)
+                self.assertTrue(
+                    any(
+                        'duplicate ' in error
+                        or 'unsupported VEVENT property form' in error
+                        for error in errors
+                    ),
+                    errors,
+                )
 
     def test_interval_checked_even_when_both_dates_within_month_windows(self):
         text = self.text
@@ -176,6 +183,39 @@ class CalendarBoundaryTests(unittest.TestCase):
         )
         _, errors = validator.validate_lines(wrong_qingming.splitlines())
         self.assertTrue(any('invalid stable UID' in error for error in errors), errors)
+
+    def test_same_window_uid_mutation_breaks_stable_identity_contract(self):
+        text = self.text.replace(
+            'UID:2015-01-06-lc@infinet.github.io',
+            'UID:2015-01-07-lc@infinet.github.io',
+            1,
+        )
+        _, errors = validator.validate_lines(text.splitlines())
+        self.assertTrue(any('stable UID contract changed' in error for error in errors), errors)
+        parsed = updater.parse_existing_events(text.splitlines())
+        with self.assertRaisesRegex(RuntimeError, 'stable UID contract changed'):
+            updater.validate_existing_events(parsed)
+
+    def test_vevent_semantics_are_closed_to_unreviewed_extensions(self):
+        for text, pattern in (
+            (
+                self.text.replace(
+                    'STATUS:CONFIRMED',
+                    'RRULE:FREQ=DAILY\nSTATUS:CONFIRMED',
+                    1,
+                ),
+                'unsupported VEVENT property RRULE',
+            ),
+            (
+                self.text.replace('STATUS:CONFIRMED', 'STATUS:CANCELLED', 1),
+                'STATUS must be CONFIRMED',
+            ),
+        ):
+            with self.subTest(pattern=pattern):
+                _, errors = validator.validate_lines(text.splitlines())
+                self.assertTrue(any(pattern in error for error in errors), errors)
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    updater.parse_existing_events(text.splitlines())
 
     def test_calendar_metadata_is_singleton_and_complete(self):
         mutations = (

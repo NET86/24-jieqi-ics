@@ -14,6 +14,7 @@ from update_calendar import (
     parse_sequence,
     validate_term_series,
     validate_uid,
+    validate_uid_contract,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,13 +47,15 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
         if current is None:
             continue
 
-        # Do not silently accept the last of conflicting singleton fields:
-        # calendar clients may select a different occurrence or parameter form.
+        # The published calendar intentionally uses a small VEVENT surface.
+        # Reject semantic extensions that would change client behavior.
         property_name = line.partition(":")[0].partition(";")[0].upper()
-        if property_name in {"DTSTAMP", "UID", "SEQUENCE", "DTSTART", "DTEND", "SUMMARY"}:
-            if property_name in seen_properties:
-                raise ValueError(f"line {line_no}: duplicate {property_name} in VEVENT")
-            seen_properties.add(property_name)
+        allowed = {"DTSTAMP", "UID", "SEQUENCE", "DTSTART", "DTEND", "STATUS", "SUMMARY"}
+        if property_name not in allowed:
+            raise ValueError(f"line {line_no}: unsupported VEVENT property {property_name}")
+        if property_name in seen_properties:
+            raise ValueError(f"line {line_no}: duplicate {property_name} in VEVENT")
+        seen_properties.add(property_name)
 
         if line.startswith("DTSTAMP:"):
             current["DTSTAMP"] = line[8:]
@@ -64,8 +67,12 @@ def parse_events(lines: list[str]) -> list[dict[str, str]]:
             current["DTSTART"] = line.removeprefix("DTSTART;VALUE=DATE:")
         elif line.startswith("DTEND;VALUE=DATE:"):
             current["DTEND"] = line.removeprefix("DTEND;VALUE=DATE:")
+        elif line.startswith("STATUS:"):
+            current["STATUS"] = line[7:]
         elif line.startswith("SUMMARY:"):
             current["SUMMARY"] = line[8:]
+        else:
+            raise ValueError(f"line {line_no}: unsupported VEVENT property form: {line}")
 
     if current is not None:
         raise ValueError("unterminated VEVENT")
@@ -118,9 +125,10 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
 
     uids: list[str] = []
     by_year: dict[int, list[tuple[date, str]]] = {}
+    uid_events: dict[tuple[int, str], dict[str, str]] = {}
 
     for index, event in enumerate(events, 1):
-        missing = [key for key in ("DTSTAMP", "UID", "DTSTART", "DTEND", "SUMMARY") if key not in event]
+        missing = [key for key in ("DTSTAMP", "UID", "DTSTART", "DTEND", "STATUS", "SUMMARY") if key not in event]
         if missing:
             errors.append(f"event {index}: missing {', '.join(missing)}")
             continue
@@ -134,6 +142,8 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
 
         if summary not in EXPECTED_TERMS:
             errors.append(f"event {index}: unexpected SUMMARY {summary!r}")
+        if event["STATUS"] != "CONFIRMED":
+            errors.append(f"event {index}: STATUS must be CONFIRMED")
 
         try:
             parse_dtstamp(event["DTSTAMP"])
@@ -173,6 +183,8 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
             )
         else:
             by_year.setdefault(start.year, []).append((start, summary))
+            if summary in EXPECTED_TERMS:
+                uid_events[(start.year, summary)] = {"UID": uid}
 
     duplicate_uids = [uid for uid, count in Counter(uids).items() if count > 1]
     if duplicate_uids:
@@ -191,6 +203,17 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
             continue
         try:
             validate_term_series(year, series)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    expected_uid_keys = {
+        (year, term)
+        for year in EXPECTED_YEARS
+        for term in EXPECTED_TERMS
+    }
+    if set(uid_events) == expected_uid_keys and not duplicate_uids:
+        try:
+            validate_uid_contract(uid_events)
         except RuntimeError as exc:
             errors.append(str(exc))
 

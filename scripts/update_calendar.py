@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import hashlib
 import os
 import re
 import shutil
@@ -109,6 +110,7 @@ DATE_UID_RE = re.compile(
 )
 QINGMING_UID_RE = re.compile(r"^(?P<year>[0-9]{4})-qingming@net86\.github\.io$")
 MAX_SEQUENCE = 2_147_483_647
+UID_CONTRACT_SHA256 = "5d92bfa1343431b2cecbac39b3c79a19ae35f462f226580c4b2e789702c6fe4c"
 
 
 def parse_dtstamp(value: str) -> datetime:
@@ -158,6 +160,24 @@ def validate_uid(uid: str, year: int, term: str, event_date: date) -> None:
     if uid_date.month != month or not min_day <= uid_date.day <= max_day:
         raise ValueError(
             f"{year} {term}: stable UID date {uid_date} is outside the term window"
+        )
+
+
+def uid_contract_digest(events: dict[tuple[int, str], dict[str, str]]) -> str:
+    rows = [
+        f"{year}\t{term}\t{events[(year, term)]['UID']}\n"
+        for year in range(START_YEAR, END_YEAR + 1)
+        for term in EXPECTED_TERMS
+    ]
+    return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
+def validate_uid_contract(events: dict[tuple[int, str], dict[str, str]]) -> None:
+    digest = uid_contract_digest(events)
+    if digest != UID_CONTRACT_SHA256:
+        raise RuntimeError(
+            "stable UID contract changed; preserve existing event identities "
+            "or explicitly review and update UID_CONTRACT_SHA256"
         )
 
 
@@ -413,7 +433,7 @@ def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, s
         if line == "END:VEVENT":
             if current is None:
                 raise RuntimeError("END:VEVENT without BEGIN:VEVENT in existing calendar")
-            required = {"DTSTAMP", "DTSTART", "DTEND", "SUMMARY", "UID"}
+            required = {"DTSTAMP", "DTSTART", "DTEND", "STATUS", "SUMMARY", "UID"}
             if not required <= current.keys():
                 missing = sorted(required.difference(current))
                 raise RuntimeError(f"existing VEVENT missing fields: {missing}")
@@ -440,6 +460,8 @@ def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, s
                 validate_uid(current["UID"], year, current["SUMMARY"], start_date)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
+            if current["STATUS"] != "CONFIRMED":
+                raise RuntimeError(f"{year} {current['SUMMARY']}: STATUS must be CONFIRMED")
             key = (year, current["SUMMARY"])
             if key in events:
                 raise RuntimeError(f"duplicate existing year/term event: {key}")
@@ -450,15 +472,12 @@ def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, s
             continue
 
         property_name = line.partition(":")[0].partition(";")[0].upper()
-        if property_name in {"DTSTAMP", "UID", "SEQUENCE", "DTSTART", "DTEND", "SUMMARY"}:
-            if property_name in seen_properties:
-                raise RuntimeError(f"line {line_no}: duplicate {property_name} in existing VEVENT")
-            seen_properties.add(property_name)
-
-        if property_name == "DTSTAMP" and not line.startswith("DTSTAMP:"):
-            raise RuntimeError(f"line {line_no}: unsupported DTSTAMP form")
-        if property_name == "SEQUENCE" and not line.startswith("SEQUENCE:"):
-            raise RuntimeError(f"line {line_no}: unsupported SEQUENCE form")
+        allowed = {"DTSTAMP", "UID", "SEQUENCE", "DTSTART", "DTEND", "STATUS", "SUMMARY"}
+        if property_name not in allowed:
+            raise RuntimeError(f"line {line_no}: unsupported VEVENT property {property_name}")
+        if property_name in seen_properties:
+            raise RuntimeError(f"line {line_no}: duplicate {property_name} in existing VEVENT")
+        seen_properties.add(property_name)
 
         if line.startswith("DTSTAMP:"):
             current["DTSTAMP"] = line[8:]
@@ -470,8 +489,12 @@ def parse_existing_events(lines: list[str]) -> dict[tuple[int, str], dict[str, s
             current["DTSTART"] = line.removeprefix("DTSTART;VALUE=DATE:")
         elif line.startswith("DTEND;VALUE=DATE:"):
             current["DTEND"] = line.removeprefix("DTEND;VALUE=DATE:")
+        elif line.startswith("STATUS:"):
+            current["STATUS"] = line[7:]
         elif line.startswith("SUMMARY:"):
             current["SUMMARY"] = line[8:]
+        else:
+            raise RuntimeError(f"line {line_no}: unsupported VEVENT property form: {line}")
 
     if current is not None:
         raise RuntimeError("unterminated VEVENT in existing calendar")
@@ -497,6 +520,7 @@ def validate_existing_events(
     uids = [event["UID"] for event in existing.values()]
     if len(uids) != len(set(uids)):
         raise RuntimeError("duplicate UID in existing calendar")
+    validate_uid_contract(existing)
 
 
 def build_calendar(
