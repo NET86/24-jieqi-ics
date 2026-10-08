@@ -23,6 +23,7 @@ README = ROOT / "README.md"
 START_YEAR = 2015
 END_YEAR = 2050
 BULK_CHANGE_STOP_THRESHOLD = 24
+MAX_HKO_RESPONSE_BYTES = 2 * 1024 * 1024
 HKO_URLS = (
     "https://www.hko.gov.hk/tc/gts/time/calendar/text/files/T{year}c.txt",
     "https://www.weather.gov.hk/tc/gts/time/calendar/text/files/T{year}c.txt",
@@ -253,6 +254,14 @@ def decode_hko(payload: bytes) -> str:
     raise ValueError("unable to decode HKO response as UTF-8 or Big5")
 
 
+def read_hko_payload(response, url: str) -> bytes:
+    # Official text/XML files are small. Never consume unbounded remote bodies.
+    payload = response.read(MAX_HKO_RESPONSE_BYTES + 1)
+    if not payload or len(payload) > MAX_HKO_RESPONSE_BYTES:
+        raise RuntimeError(f"empty or oversized HKO response for {url}")
+    return payload
+
+
 def validate_term_series(year: int, found: list[tuple[date, str]]) -> None:
     terms = tuple(term for _, term in found)
     if len(found) != 24:
@@ -335,7 +344,7 @@ def fetch_source(
                 content_type = response.headers.get("Content-Type", "")
                 if "text" not in content_type.lower():
                     raise RuntimeError(f"unexpected Content-Type {content_type!r} for {url}")
-                text = decode_hko(response.read())
+                text = decode_hko(read_hko_payload(response, url))
             return parse_hko_text(year, text), final_host
         except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
             last_error = exc
@@ -418,7 +427,7 @@ def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str],
                 content_type = response.headers.get("Content-Type", "")
                 if "xml" not in content_type.lower():
                     raise RuntimeError(f"unexpected Content-Type {content_type!r} for {url}")
-                payload = response.read()
+                payload = read_hko_payload(response, url)
 
             root = ET.fromstring(payload)
             rows = root.findall(".//Data")

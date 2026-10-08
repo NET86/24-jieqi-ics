@@ -259,6 +259,41 @@ class CalendarBoundaryTests(unittest.TestCase):
             with self.subTest(final=final), self.assertRaisesRegex(RuntimeError, "redirected outside"):
                 updater.validate_hko_final_url(requested, final)
 
+    def test_hko_text_and_xml_fetches_reject_oversized_responses(self):
+        cases = (
+            (
+                updater.HKO_URLS[0].format(year=2026),
+                "text/plain",
+                lambda: updater.fetch_source(2026, updater.HKO_URLS[0], attempts=1),
+            ),
+            (
+                updater.HKO_ASTRONOMY_XML.format(year=2026),
+                "application/xml",
+                lambda: updater.fetch_astronomy_xml(2026, attempts=1),
+            ),
+        )
+        for url, content_type, fetch in cases:
+            with self.subTest(url=url):
+                response = mock.MagicMock()
+                response.status = 200
+                response.headers = {"Content-Type": content_type}
+                response.geturl.return_value = url
+                response.__enter__.return_value = response
+                response.read.side_effect = lambda amount: b"x" * amount
+                with mock.patch.object(updater, "urlopen", return_value=response):
+                    with self.assertRaisesRegex(RuntimeError, "oversized HKO response"):
+                        fetch()
+                response.read.assert_called_once_with(updater.MAX_HKO_RESPONSE_BYTES + 1)
+
+    def test_hko_payload_read_is_bounded_and_rejects_empty_input(self):
+        source = mock.Mock()
+        source.read.return_value = b"small HKO source"
+        self.assertEqual(updater.read_hko_payload(source, "https://www.hko.gov.hk/"), b"small HKO source")
+        source.read.assert_called_once_with(updater.MAX_HKO_RESPONSE_BYTES + 1)
+        source.read.return_value = b""
+        with self.assertRaisesRegex(RuntimeError, "empty or oversized"):
+            updater.read_hko_payload(source, "https://www.hko.gov.hk/")
+
     def test_duplicate_final_hko_source_does_not_count_twice(self):
         existing = updater.parse_existing_events(self.lines)
         data = tuple(
