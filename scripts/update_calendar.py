@@ -14,7 +14,9 @@ from http.client import HTTPException
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from zoneinfo import ZoneInfo
+
+# Maintenance dates use modern Beijing UTC+8, independent of host tzdata.
+BEIJING_TIMEZONE = timezone(timedelta(hours=8), name="UTC+08:00")
 
 ROOT = Path(__file__).resolve().parents[1]
 ICS = ROOT / "24_solar_terms_2015-01-01_2050-12-31.ics"
@@ -463,7 +465,7 @@ def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str],
 def crosscheck_near_term_astronomy(
     official: dict[int, list[tuple[date, str]]],
 ) -> list[int]:
-    current_year = datetime.now(ZoneInfo("Asia/Shanghai")).year
+    current_year = datetime.now(BEIJING_TIMEZONE).year
     start = max(START_YEAR, current_year)
     end = min(END_YEAR, current_year + 2)
     checked: list[int] = []
@@ -655,7 +657,7 @@ def build_calendar(
     return "\n".join(lines) + "\n"
 
 def update_verified_date(readme: str) -> str:
-    verified = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    verified = datetime.now(BEIJING_TIMEZONE).date().isoformat()
     replacement = f"最近核验：{verified}"
     updated, count = VERIFIED_RE.subn(replacement, readme, count=1)
     if count != 1:
@@ -760,7 +762,7 @@ def publish_outputs(calendar: str, readme: str) -> None:
 
 def main() -> int:
     recover_publication_transaction()
-    current_year = datetime.now(ZoneInfo("Asia/Shanghai")).year
+    current_year = datetime.now(BEIJING_TIMEZONE).year
     if current_year > END_YEAR:
         raise RuntimeError(
             f"current year {current_year} exceeds maintained range ending {END_YEAR}; "
