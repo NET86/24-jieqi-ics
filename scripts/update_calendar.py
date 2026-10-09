@@ -341,9 +341,8 @@ def fetch_source(
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
                 final_host = validate_hko_final_url(url, response.geturl())
-                content_type = response.headers.get("Content-Type", "")
-                if "text" not in content_type.lower():
-                    raise RuntimeError(f"unexpected Content-Type {content_type!r} for {url}")
+                # Trust the approved HKO URL and bounded, semantically validated body,
+                # not a possibly mislabelled or missing Content-Type header.
                 text = decode_hko(read_hko_payload(response, url))
             return parse_hko_text(year, text), final_host
         except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
@@ -424,9 +423,8 @@ def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str],
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
                 validate_hko_final_url(url, response.geturl())
-                content_type = response.headers.get("Content-Type", "")
-                if "xml" not in content_type.lower():
-                    raise RuntimeError(f"unexpected Content-Type {content_type!r} for {url}")
+                # Verify trusted HTTPS, bounded bytes, well-formed XML and all
+                # 24 astronomical terms; MIME metadata alone is not authoritative.
                 payload = read_hko_payload(response, url)
 
             root = ET.fromstring(payload)
