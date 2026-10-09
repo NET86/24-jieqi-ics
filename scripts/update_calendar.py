@@ -258,9 +258,25 @@ def decode_hko(payload: bytes) -> str:
 
 def read_hko_payload(response, url: str) -> bytes:
     # Official text/XML files are small. Never consume unbounded remote bodies.
+    # HTTPResponse.read(n) can return fewer bytes than Content-Length without
+    # raising IncompleteRead, even if all 24 calendar terms are present.
+    declared_length = getattr(response, "length", None)
+    # Some offline test doubles do not model HTTPResponse.length; only a real
+    # non-negative integer expresses fixed-length framing here.
+    if type(declared_length) is not int:
+        declared_length = None
+    elif declared_length < 0:
+        raise RuntimeError(f"invalid HKO response length for {url}")
+    elif declared_length > MAX_HKO_RESPONSE_BYTES:
+        raise RuntimeError(f"oversized HKO response for {url}")
     payload = response.read(MAX_HKO_RESPONSE_BYTES + 1)
     if not payload or len(payload) > MAX_HKO_RESPONSE_BYTES:
         raise RuntimeError(f"empty or oversized HKO response for {url}")
+    if declared_length is not None and len(payload) != declared_length:
+        raise RuntimeError(
+            f"incomplete HKO response for {url}: "
+            f"declared {declared_length} bytes, received {len(payload)}"
+        )
     return payload
 
 
@@ -325,24 +341,34 @@ def validate_hko_final_url(requested_url: str, final_url: str) -> str:
     return final.hostname
 
 
+def validate_hko_redirect_chain(request: Request, final_url: str) -> str:
+    """Validate each urllib redirect target, not only the final HKO endpoint."""
+    final_host = validate_hko_final_url(request.full_url, final_url)
+    for hop in getattr(request, "redirect_dict", {}):
+        validate_hko_final_url(request.full_url, hop)
+    return final_host
+
+
 def fetch_source(
     year: int,
     url_template: str,
     attempts: int = 2,
 ) -> tuple[tuple[tuple[date, str], ...], str]:
     url = url_template.format(year=year)
-    request = Request(
-        url,
-        headers={"User-Agent": "NET86-24-jieqi-ics/1.0 (+https://github.com/NET86/24-jieqi-ics)"},
-    )
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
+        # Redirect history must be scoped to this attempt. A failed downgrade
+        # must not contaminate an otherwise valid retry.
+        request = Request(
+            url,
+            headers={"User-Agent": "NET86-24-jieqi-ics/1.0 (+https://github.com/NET86/24-jieqi-ics)"},
+        )
         try:
             with urlopen(request, timeout=20) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
-                final_host = validate_hko_final_url(url, response.geturl())
+                final_host = validate_hko_redirect_chain(request, response.geturl())
                 # Trust the approved HKO URL and bounded, semantically validated body,
                 # not a possibly mislabelled or missing Content-Type header.
                 text = decode_hko(read_hko_payload(response, url))
@@ -413,18 +439,20 @@ def fetch_year(year: int) -> list[tuple[date, str]]:
 
 def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str], ...]:
     url = HKO_ASTRONOMY_XML.format(year=year)
-    request = Request(
-        url,
-        headers={"User-Agent": "NET86-24-jieqi-ics/1.0 (+https://github.com/NET86/24-jieqi-ics)"},
-    )
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
+        # Redirect history must be scoped to this attempt. A failed downgrade
+        # must not contaminate an otherwise valid retry.
+        request = Request(
+            url,
+            headers={"User-Agent": "NET86-24-jieqi-ics/1.0 (+https://github.com/NET86/24-jieqi-ics)"},
+        )
         try:
             with urlopen(request, timeout=20) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
-                validate_hko_final_url(url, response.geturl())
+                validate_hko_redirect_chain(request, response.geturl())
                 # Verify trusted HTTPS, bounded bytes, well-formed XML and all
                 # 24 astronomical terms; MIME metadata alone is not authoritative.
                 payload = read_hko_payload(response, url)
