@@ -10,7 +10,7 @@ import shutil
 import sys
 import tempfile
 import time
-from urllib.error import HTTPError, URLError
+from http.client import HTTPException
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
@@ -345,7 +345,7 @@ def fetch_source(
                 # not a possibly mislabelled or missing Content-Type header.
                 text = decode_hko(read_hko_payload(response, url))
             return parse_hko_text(year, text), final_host
-        except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
+        except (OSError, HTTPException, ValueError, RuntimeError) as exc:
             last_error = exc
             if attempt < attempts:
                 time.sleep(attempt * 2)
@@ -447,9 +447,8 @@ def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str],
             validate_term_series(year, found)
             return tuple(found)
         except (
-            HTTPError,
-            URLError,
-            TimeoutError,
+            OSError,
+            HTTPException,
             ValueError,
             RuntimeError,
             ET.ParseError,
