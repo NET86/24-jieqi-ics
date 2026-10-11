@@ -110,7 +110,7 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
             errors.append(f"event {index}: missing {', '.join(missing)}")
             continue
 
-        uid = event["UID"].strip()
+        uid = event["UID"]
         summary = event["SUMMARY"]
         if not uid:
             errors.append(f"event {index}: empty UID")
