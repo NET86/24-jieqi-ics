@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "1 1 1,15 * *"
+    - cron: "1 0 1,15 * *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
 
