@@ -184,6 +184,26 @@ class CalendarBoundaryTests(unittest.TestCase):
         _, errors = validator.validate_lines(wrong_qingming.splitlines())
         self.assertTrue(any('invalid stable UID' in error for error in errors), errors)
 
+    def test_uid_surrounding_whitespace_is_rejected_without_normalization(self):
+        _, errors = validator.validate_lines(self.lines)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(updater.parse_existing_events(self.lines)),
+                         validator.EXPECTED_EVENT_COUNT)
+        original = 'UID:2015-01-06-lc@infinet.github.io'
+        self.assertIn(original, self.text)
+        for prefix, suffix in ((' ', ''), ('', ' '), ('\t', ''), ('', '\t')):
+            with self.subTest(prefix=prefix, suffix=suffix):
+                text = self.text.replace(original,
+                                         'UID:' + prefix + original[4:] + suffix, 1)
+                lines = text.splitlines()
+                with self.assertRaisesRegex(RuntimeError, 'invalid stable UID'):
+                    updater.parse_existing_events(lines)
+                _, errors = validator.validate_lines(lines)
+                self.assertTrue(any('invalid stable UID' in error for error in errors),
+                                errors)
+                self.assertTrue(any('stable UID contract changed' in error
+                                    for error in errors), errors)
+
     def test_same_window_uid_mutation_breaks_stable_identity_contract(self):
         text = self.text.replace(
             'UID:2015-01-06-lc@infinet.github.io',
