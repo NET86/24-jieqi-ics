@@ -13,6 +13,7 @@ from update_calendar import (
     parse_dtstamp,
     parse_sequence,
     validate_calendar_envelope,
+    validate_cross_year_intervals,
     validate_term_series,
     validate_uid,
     validate_uid_contract,
@@ -182,6 +183,11 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
             validate_term_series(year, series)
         except RuntimeError as exc:
             errors.append(str(exc))
+
+    try:
+        validate_cross_year_intervals(by_year)
+    except RuntimeError as exc:
+        errors.append(str(exc))
 
     expected_uid_keys = {
         (year, term)

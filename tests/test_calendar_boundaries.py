@@ -82,7 +82,7 @@ class CalendarBoundaryTests(unittest.TestCase):
         for (year, term), event in existing.items():
             official.setdefault(year, []).append((datetime.strptime(event['DTSTART'], '%Y%m%d').date(), term))
         self.assertEqual(updater.describe_date_changes(official, existing), [])
-        self.assertEqual(updater.build_calendar(official, existing), '\n'.join(self.lines) + '\n')
+        self.assertEqual(updater.build_calendar(official, existing), '\r\n'.join(self.lines) + '\r\n')
         corrupted = copy.deepcopy(existing)
         corrupted[(2015, '小寒')]['DTSTART'] = '20150701'
         with self.assertRaisesRegex(RuntimeError, 'refusing 176-day date jump'):

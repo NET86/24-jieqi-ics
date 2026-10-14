@@ -1,0 +1,2 @@
+# Keep RFC 5545 CRLF bytes in both the repository blob and the worktree.
+*.ics -text whitespace=cr-at-eol

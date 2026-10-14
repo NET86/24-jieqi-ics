@@ -297,13 +297,31 @@ def validate_term_series(year: int, found: list[tuple[date, str]]) -> None:
                 f"expected month {month}, day {min_day}-{max_day}"
             )
 
+    validate_term_intervals(found)
+
+
+def validate_term_intervals(found: list[tuple[date, str]]) -> None:
     for (left_date, left_term), (right_date, right_term) in zip(found, found[1:]):
         interval = (right_date - left_date).days
         if not 14 <= interval <= 17:
             raise RuntimeError(
-                f"{year}: implausible interval {interval} days "
-                f"between {left_term} and {right_term}"
+                f"{left_date.year}: implausible interval {interval} days "
+                f"between {left_term} ({left_date}) and {right_term} ({right_date})"
             )
+
+
+def validate_cross_year_intervals(by_year: dict[int, list[tuple[date, str]]]) -> None:
+    """Check available consecutive years, including a fetched year subset."""
+    for year in sorted(by_year):
+        left, right = by_year[year], by_year.get(year + 1, [])
+        if left and right:
+            validate_term_intervals([max(left), min(right)])
+
+
+def validate_calendar_series(by_year: dict[int, list[tuple[date, str]]]) -> None:
+    for year, found in sorted(by_year.items()):
+        validate_term_series(year, found)
+    validate_cross_year_intervals(by_year)
 
 
 def parse_hko_text(year: int, text: str) -> tuple[tuple[date, str], ...]:
@@ -621,6 +639,11 @@ def validate_existing_events(
     if len(uids) != len(set(uids)):
         raise RuntimeError("duplicate UID in existing calendar")
     validate_uid_contract(existing)
+    by_year: dict[int, list[tuple[date, str]]] = {}
+    for (year, term), event in existing.items():
+        event_date = datetime.strptime(event["DTSTART"], "%Y%m%d").date()
+        by_year.setdefault(year, []).append((event_date, term))
+    validate_calendar_series({year: sorted(series) for year, series in by_year.items()})
 
 
 def build_calendar(
@@ -628,6 +651,7 @@ def build_calendar(
     existing: dict[tuple[int, str], dict[str, str]],
     now: datetime | None = None,
 ) -> str:
+    validate_calendar_series(official)
     if now is None:
         now = datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -682,7 +706,7 @@ def build_calendar(
             lines.extend(event_lines)
 
     lines.append("END:VCALENDAR")
-    return "\n".join(lines) + "\n"
+    return "\r\n".join(lines) + "\r\n"
 
 def update_verified_date(readme: str) -> str:
     verified = datetime.now(BEIJING_TIMEZONE).date().isoformat()
@@ -754,13 +778,6 @@ def recover_publication_transaction() -> None:
 def validate_staged_outputs(calendar: str, readme: str) -> None:
     events = parse_existing_events(calendar.splitlines())
     validate_existing_events(events)
-    by_year: dict[int, list[tuple[date, str]]] = {}
-    for (year, term), event in events.items():
-        event_date = datetime.strptime(event["DTSTART"], "%Y%m%d").date()
-        by_year.setdefault(year, []).append((event_date, term))
-    for year in range(START_YEAR, END_YEAR + 1):
-        ordered = sorted(by_year.get(year, []))
-        validate_term_series(year, ordered)
 
     if len(VERIFIED_RE.findall(readme)) != 1:
         raise RuntimeError("staged README must contain exactly one verification date marker")
