@@ -10,6 +10,7 @@ from update_calendar import (
     END_YEAR,
     EXPECTED_TERMS,
     START_YEAR,
+    split_ics_lines,
     parse_dtstamp,
     parse_sequence,
     validate_calendar_envelope,
@@ -204,7 +205,11 @@ def validate_lines(lines: list[str]) -> tuple[list[dict[str, str]], list[str]]:
 
 
 def main() -> int:
-    lines = ICS.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = split_ics_lines(ICS.read_bytes().decode('utf-8'))
+    except (RuntimeError, UnicodeError) as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        return 1
     events, errors = validate_lines(lines)
 
     if errors:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import hashlib
 import os
@@ -11,8 +12,8 @@ import sys
 import tempfile
 import time
 from http.client import HTTPException
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, HTTPRedirectHandler, build_opener, urlopen as standard_urlopen
 import xml.etree.ElementTree as ET
 
 # Maintenance dates use modern Beijing UTC+8, independent of host tzdata.
@@ -26,6 +27,8 @@ START_YEAR = 2015
 END_YEAR = 2050
 BULK_CHANGE_STOP_THRESHOLD = 24
 MAX_HKO_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_YEAR_WORKERS = 6
+OFFICIAL_FETCH_BUDGET_SECONDS = 420
 HKO_URLS = (
     "https://www.hko.gov.hk/tc/gts/time/calendar/text/files/T{year}c.txt",
     "https://www.weather.gov.hk/tc/gts/time/calendar/text/files/T{year}c.txt",
@@ -256,7 +259,49 @@ def decode_hko(payload: bytes) -> str:
     raise ValueError("unable to decode HKO response as UTF-8 or Big5")
 
 
-def read_hko_payload(response, url: str) -> bytes:
+def remaining_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return 20.0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError('official verification time budget exhausted')
+    return min(20.0, remaining)
+
+
+def retry_pause(seconds: float, deadline: float | None) -> None:
+    timeout = remaining_timeout(deadline)
+    time.sleep(min(seconds, timeout))
+
+
+class HkoDeadlineRedirects(HTTPRedirectHandler):
+    def __init__(self, deadline):
+        self.deadline = deadline
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_hko_final_url(req.full_url, urljoin(req.full_url, newurl))
+        req.timeout = remaining_timeout(self.deadline)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        class NoBody:
+            def read(self, *args): return b''
+            def close(self): fp.close()
+        try:
+            return super().http_error_302(req, NoBody(), code, msg, headers)
+        finally:
+            fp.close()
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def urlopen(request, timeout):
+    deadline = getattr(request, '_hko_deadline', None)
+    if deadline is None:
+        return standard_urlopen(request, timeout=timeout)
+    return build_opener(HkoDeadlineRedirects(deadline)).open(
+        request, timeout=min(timeout, remaining_timeout(deadline)))
+
+
+def read_hko_payload(response, url: str, *, deadline: float | None = None) -> bytes:
     # Official text/XML files are small. Never consume unbounded remote bodies.
     # HTTPResponse.read(n) can return fewer bytes than Content-Length without
     # raising IncompleteRead, even if all 24 calendar terms are present.
@@ -269,7 +314,27 @@ def read_hko_payload(response, url: str) -> bytes:
         raise RuntimeError(f"invalid HKO response length for {url}")
     elif declared_length > MAX_HKO_RESPONSE_BYTES:
         raise RuntimeError(f"oversized HKO response for {url}")
-    payload = response.read(MAX_HKO_RESPONSE_BYTES + 1)
+    if deadline is None:
+        payload = response.read(MAX_HKO_RESPONSE_BYTES + 1)
+    else:
+        # read1 returns after an available chunk instead of waiting for a full
+        # large read while a server slowly drips bytes. Bound each socket read
+        # by the remaining run deadline as well as the normal request timeout.
+        chunks = bytearray()
+        reader = getattr(response, 'read1', response.read)
+        while len(chunks) <= MAX_HKO_RESPONSE_BYTES:
+            timeout = remaining_timeout(deadline)
+            sock = getattr(getattr(getattr(response, 'fp', None), 'raw', None), '_sock', None)
+            if sock is not None:
+                sock.settimeout(timeout)
+            chunk = reader(min(65536, MAX_HKO_RESPONSE_BYTES + 1 - len(chunks)))
+            remaining_timeout(deadline)
+            if not chunk:
+                break
+            chunks.extend(chunk)
+            if declared_length is not None and len(chunks) >= declared_length:
+                break
+        payload = bytes(chunks)
     if not payload or len(payload) > MAX_HKO_RESPONSE_BYTES:
         raise RuntimeError(f"empty or oversized HKO response for {url}")
     if declared_length is not None and len(payload) != declared_length:
@@ -371,50 +436,57 @@ def fetch_source(
     year: int,
     url_template: str,
     attempts: int = 2,
+    *, deadline: float | None = None,
 ) -> tuple[tuple[tuple[date, str], ...], str]:
     url = url_template.format(year=year)
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
+        timeout = remaining_timeout(deadline)
         # Redirect history must be scoped to this attempt. A failed downgrade
         # must not contaminate an otherwise valid retry.
         request = Request(
             url,
             headers={"User-Agent": "NET86-24-jieqi-ics/1.0 (+https://github.com/NET86/24-jieqi-ics)"},
         )
+        request._hko_deadline = deadline
         try:
-            with urlopen(request, timeout=20) as response:
+            with urlopen(request, timeout=timeout) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
                 final_host = validate_hko_redirect_chain(request, response.geturl())
                 # Trust the approved HKO URL and bounded, semantically validated body,
                 # not a possibly mislabelled or missing Content-Type header.
-                text = decode_hko(read_hko_payload(response, url))
+                text = decode_hko(read_hko_payload(response, url, deadline=deadline))
             return parse_hko_text(year, text), final_host
         except (OSError, HTTPException, ValueError, RuntimeError) as exc:
             last_error = exc
             if attempt < attempts:
-                time.sleep(attempt * 2)
+                retry_pause(attempt * 2, deadline)
 
     raise RuntimeError(f"{url}: {last_error}")
 
 
-def fetch_year(year: int) -> list[tuple[date, str]]:
+def fetch_year(year: int, *, deadline: float | None = None) -> list[tuple[date, str]]:
     results: dict[str, tuple[tuple[date, str], ...]] = {}
     failures: list[str] = []
 
     def collect(url_template: str) -> None:
         requested_host = urlparse(url_template).hostname or url_template
         try:
-            data, final_host = fetch_source(year, url_template)
-            previous = results.get(final_host)
-            if previous is not None and previous != data:
-                raise RuntimeError(
-                    f"{year}: repeated final HKO source {final_host} returned inconsistent data"
-                )
-            results[final_host] = data
+            data, final_host = (fetch_source(year, url_template) if deadline is None
+                                else fetch_source(year, url_template, deadline=deadline))
         except RuntimeError as exc:
             failures.append(f"{requested_host}: {exc}")
+            return
+        previous = results.get(final_host)
+        if previous is not None and previous != data:
+            # Contradiction is a failed year, not a failed mirror that leaves
+            # its first vote available to form a later majority.
+            raise RuntimeError(
+                f"{year}: repeated final HKO source {final_host} returned inconsistent data"
+            )
+        results[final_host] = data
 
     # Normal path: two independently resolved official final hosts agree.
     for url_template in HKO_URLS[:2]:
@@ -455,25 +527,27 @@ def fetch_year(year: int) -> list[tuple[date, str]]:
     )
     raise RuntimeError(f"{year}: no 2-of-3 HKO consensus: {detail}")
 
-def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str], ...]:
+def fetch_astronomy_xml(year: int, attempts: int = 2, *, deadline: float | None = None) -> tuple[tuple[date, str], ...]:
     url = HKO_ASTRONOMY_XML.format(year=year)
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
+        timeout = remaining_timeout(deadline)
         # Redirect history must be scoped to this attempt. A failed downgrade
         # must not contaminate an otherwise valid retry.
         request = Request(
             url,
             headers={"User-Agent": "NET86-24-jieqi-ics/1.0 (+https://github.com/NET86/24-jieqi-ics)"},
         )
+        request._hko_deadline = deadline
         try:
-            with urlopen(request, timeout=20) as response:
+            with urlopen(request, timeout=timeout) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
                 validate_hko_redirect_chain(request, response.geturl())
                 # Verify trusted HTTPS, bounded bytes, well-formed XML and all
                 # 24 astronomical terms; MIME metadata alone is not authoritative.
-                payload = read_hko_payload(response, url)
+                payload = read_hko_payload(response, url, deadline=deadline)
 
             root = ET.fromstring(payload)
             rows = root.findall(".//Data")
@@ -503,13 +577,14 @@ def fetch_astronomy_xml(year: int, attempts: int = 2) -> tuple[tuple[date, str],
         ) as exc:
             last_error = exc
             if attempt < attempts:
-                time.sleep(attempt * 2)
+                retry_pause(attempt * 2, deadline)
 
     raise RuntimeError(f"{url}: {last_error}")
 
 
 def crosscheck_near_term_astronomy(
     official: dict[int, list[tuple[date, str]]],
+    *, deadline: float | None = None,
 ) -> list[int]:
     current_year = datetime.now(BEIJING_TIMEZONE).year
     start = max(START_YEAR, current_year)
@@ -517,7 +592,8 @@ def crosscheck_near_term_astronomy(
     checked: list[int] = []
 
     for year in range(start, end + 1):
-        astronomy = fetch_astronomy_xml(year)
+        astronomy = (fetch_astronomy_xml(year) if deadline is None
+                     else fetch_astronomy_xml(year, deadline=deadline))
         calendar = tuple(official[year])
         if astronomy != calendar:
             mismatches = [
@@ -775,8 +851,17 @@ def recover_publication_transaction() -> None:
     shutil.rmtree(TRANSACTION_DIR)
 
 
+def split_ics_lines(text: str) -> list[str]:
+    """ICS content lines use CRLF (or an already normalized LF), not Unicode separators."""
+    normalized = text.replace('\r\n', '\n')
+    if '\r' in normalized:
+        raise RuntimeError('bare CR is not an ICS content-line delimiter')
+    lines = normalized.split('\n')
+    return lines[:-1] if normalized.endswith('\n') else lines
+
+
 def validate_staged_outputs(calendar: str, readme: str) -> None:
-    events = parse_existing_events(calendar.splitlines())
+    events = parse_existing_events(split_ics_lines(calendar))
     validate_existing_events(events)
 
     if len(VERIFIED_RE.findall(readme)) != 1:
@@ -814,17 +899,26 @@ def main() -> int:
             "manual range review required"
         )
 
-    existing_lines = ICS.read_text(encoding="utf-8").splitlines()
+    existing_lines = split_ics_lines(ICS.read_bytes().decode('utf-8'))
     existing = parse_existing_events(existing_lines)
     validate_existing_events(existing)
     readme_text = README.read_text(encoding="utf-8")
     readme = update_verified_date(readme_text)
 
-    official: dict[int, list[tuple[date, str]]] = {}
-    for year in range(START_YEAR, END_YEAR + 1):
-        official[year] = fetch_year(year)
-
-    astronomy_years = crosscheck_near_term_astronomy(official)
+    deadline = time.monotonic() + OFFICIAL_FETCH_BUDGET_SECONDS
+    # At most six active years: a failed mirror's two 20s attempts and 2s
+    # backoff no longer repeat serially 36 times (about 25 minutes).
+    with ThreadPoolExecutor(max_workers=MAX_YEAR_WORKERS) as pool:
+        pending = {year: pool.submit(fetch_year, year, deadline=deadline)
+                   for year in range(START_YEAR, END_YEAR + 1)}
+        try:
+            official = {year: task.result() for year, task in pending.items()}
+        except BaseException:
+            for task in pending.values():
+                task.cancel()
+            raise
+    astronomy_years = crosscheck_near_term_astronomy(official, deadline=deadline)
+    remaining_timeout(deadline)
 
     changes = describe_date_changes(official, existing)
     if len(changes) >= BULK_CHANGE_STOP_THRESHOLD:
